@@ -24,6 +24,8 @@ Environment variables (set in the Vercel dashboard):
                                numbers printed WITHOUT a country code when the
                                card's own country can't be worked out. Default "IN".
   GEMINI_MODEL                 (optional) default "gemini-3.8-flash"
+  GEMINI_FALLBACK_MODEL        (optional) used if the main model is busy/slow. Default "gemini-3.5-flash-lite"
+  GEMINI_THINKING              (optional) minimal | low | medium | high. Default "low" (fastest sensible)
 """
 
 import hmac
@@ -53,6 +55,13 @@ from pydantic import BaseModel, Field
 # --------------------------------------------------------------------------
 
 DEFAULT_MODEL = "gemini-3.8-flash"
+DEFAULT_FALLBACK_MODEL = "gemini-3.5-flash-lite"
+
+# Telegram stops waiting for our reply after about a minute and then SENDS THE SAME MESSAGE AGAIN,
+# which used to cause double processing. So everything must finish well inside that time.
+REQUEST_BUDGET_SECONDS = 50
+RESERVE_SECONDS = 8              # kept free for re-checking/writing the sheet, sending the vCard, replying
+FIRST_ATTEMPT_MAX_SECONDS = 25   # max wait on the main model before switching to the backup model
 
 # Row 1 of the sheet must be exactly these headers, in this order (columns A-P).
 # You may add your own extra columns to the RIGHT of column P.
@@ -95,6 +104,10 @@ def log(*args):
 
 def env(name, default=None, required=False):
     value = os.environ.get(name, default)
+    if isinstance(value, str):
+        value = value.strip()  # ignore accidental spaces / line breaks around a pasted value
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1].strip()  # ...and quote marks wrapped around it
     if required and not value:
         raise RuntimeError(f"Missing environment variable: {name}")
     return value
@@ -238,36 +251,30 @@ def normalize_card(raw):
     return card
 
 
-def extract_card(image_bytes):
-    client = genai.Client(
-        api_key=env("GEMINI_API_KEY", required=True),
-        http_options=types.HttpOptions(timeout=90_000),  # milliseconds
-    )
-    config = types.GenerateContentConfig(
+def is_busy_error(e):
+    """True for 'Gemini is overloaded / rate-limited / too slow' style errors (worth trying the backup model)."""
+    code = getattr(e, "code", None)
+    text = f"{type(e).__name__} {e}".lower()
+    return (code in (408, 429, 500, 502, 503, 504) or "timeout" in text or "timed out" in text
+            or "overloaded" in text or "high demand" in text or "unavailable" in text)
+
+
+def gemini_config(thinking_level):
+    extra = {}
+    level = getattr(types.ThinkingLevel, thinking_level.strip().upper(), None) if thinking_level else None
+    if level is not None:
+        # Less "thinking" = much faster. Reading a card doesn't need deep reasoning.
+        extra["thinking_config"] = types.ThinkingConfig(thinking_level=level)
+    return types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
         response_mime_type="application/json",
         response_schema=BusinessCard,
         max_output_tokens=8192,  # generous: the model's "thinking" tokens count towards this
+        **extra,
     )
-    contents = [
-        types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-        "Read this business card.",
-    ]
-    model = env("GEMINI_MODEL", DEFAULT_MODEL)
 
-    response = None
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(model=model, contents=contents, config=config)
-            break
-        except Exception as e:
-            busy = getattr(e, "code", None) in (429, 500, 502, 503, 504)
-            if busy and attempt < 2:  # temporary overload / rate limit: wait a moment and retry
-                log(f"Gemini busy (attempt {attempt + 1}):", e)
-                time.sleep(2 * (attempt + 1))
-                continue
-            raise
 
+def parse_gemini_response(response):
     parsed = getattr(response, "parsed", None)
     if parsed is not None:
         raw = parsed.model_dump() if hasattr(parsed, "model_dump") else dict(parsed)
@@ -280,6 +287,53 @@ def extract_card(image_bytes):
         except json.JSONDecodeError:
             raise RuntimeError("Gemini's answer was cut off or malformed. Please send the photo again.")
     return normalize_card(raw)
+
+
+def extract_card(image_bytes, deadline=None):
+    """Read the card with Gemini. Never waits past `deadline` (a time.monotonic() value).
+    Main model first; if it is busy or slow, the backup model gets the remaining time."""
+    api_key = env("GEMINI_API_KEY", required=True)
+    if deadline is None:
+        deadline = time.monotonic() + REQUEST_BUDGET_SECONDS
+    primary = env("GEMINI_MODEL", DEFAULT_MODEL)
+    backup = env("GEMINI_FALLBACK_MODEL", DEFAULT_FALLBACK_MODEL)
+    models = [primary] + ([backup] if backup and backup != primary else [])
+    level = env("GEMINI_THINKING", "low")
+    contents = [
+        types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+        "Read this business card.",
+    ]
+
+    last_error = None
+    for position, model in enumerate(models):
+        available = deadline - time.monotonic() - RESERVE_SECONDS
+        if available < 6:
+            break  # not enough time left to try anything else
+        is_last = position == len(models) - 1
+        timeout = available if is_last else min(available, FIRST_ATTEMPT_MAX_SECONDS)
+        use_level = level
+        for _ in range(2):  # a 2nd pass happens only if this model refuses the thinking setting
+            try:
+                client = genai.Client(
+                    api_key=api_key,
+                    http_options=types.HttpOptions(timeout=int(timeout * 1000)),  # milliseconds
+                )
+                response = client.models.generate_content(
+                    model=model, contents=contents, config=gemini_config(use_level)
+                )
+                return parse_gemini_response(response)
+            except Exception as e:
+                if use_level and getattr(e, "code", None) == 400 and "thinking" in str(e).lower():
+                    use_level = ""  # this model doesn't accept that thinking level: retry without it
+                    continue
+                last_error = e
+                if is_busy_error(e):
+                    log(f"Gemini model {model} busy/slow: {e}")
+                    break  # try the backup model
+                raise
+    raise RuntimeError(
+        "Gemini is busy right now (it did not answer in time). Please send the card again in a minute."
+    ) from last_error
 
 
 # --------------------------------------------------------------------------
@@ -365,7 +419,8 @@ def phones_cell(entries):
 
 def open_sheet():
     """Open the worksheet, make sure row 1 is right, and return (worksheet, all_rows)."""
-    info = json.loads(env("GOOGLE_SERVICE_ACCOUNT_JSON", required=True))
+    # raw_decode reads the first complete JSON object and ignores anything accidentally pasted after it
+    info, _ = json.JSONDecoder().raw_decode(env("GOOGLE_SERVICE_ACCOUNT_JSON", required=True))
     if "private_key" in info:  # fixes keys whose line breaks got double-escaped when pasted
         info["private_key"] = info["private_key"].replace("\\n", "\n")
     creds = Credentials.from_service_account_info(
@@ -654,6 +709,41 @@ def vcard_caption(card):
 # Main logic
 # --------------------------------------------------------------------------
 
+_SEEN_UPDATES = {}  # update_id -> time, per running instance
+
+
+def already_handled(update_id):
+    """Telegram can deliver the same update twice. Ignore the repeat."""
+    if update_id is None:
+        return False
+    now = time.time()
+    for old in [k for k, t in _SEEN_UPDATES.items() if now - t > 900]:
+        del _SEEN_UPDATES[old]
+    if update_id in _SEEN_UPDATES:
+        return True
+    _SEEN_UPDATES[update_id] = now
+    return False
+
+
+def friendly_error(e):
+    """Turn a technical error into a plain-English message."""
+    text = str(e)
+    low = text.lower()
+    code = getattr(e, "code", None)
+    if isinstance(e, json.JSONDecodeError):
+        return ("The Google credentials saved in Vercel (GOOGLE_SERVICE_ACCOUNT_JSON) can't be read. "
+                "Paste the whole key file once, from { to }, then Redeploy.")
+    if "api_key_invalid" in low or "api key not valid" in low:
+        return "Gemini rejected the API key. Check GEMINI_API_KEY in Vercel (no spaces or quotes), then Redeploy."
+    if code == 429 or "resource_exhausted" in low:
+        return "Gemini's usage limit was reached. Wait a minute and send the card again."
+    if "gemini is busy" in low or code in (500, 502, 503, 504) or "overloaded" in low or "high demand" in low:
+        return "Gemini is busy right now. Please send the card again in a minute."
+    if "does not have permission" in low or "permission_denied" in low:
+        return "Google Sheets refused access. Share the Sheet with the service-account email as Editor."
+    return f"Something went wrong: {text[:600]}"
+
+
 def allowed_user_ids():
     return {int(x) for x in re.split(r"[,\s]+", env("ALLOWED_USER_IDS", "")) if x.strip().isdigit()}
 
@@ -693,8 +783,12 @@ def summary_text(card, phones_text, misc_text, saved_ok, row_number=None, link="
 
 
 def process_update(update):
+    started = time.monotonic()
     msg = update.get("message")
     if not msg:
+        return
+    if already_handled(update.get("update_id")):
+        log("ignoring repeated delivery of update", update.get("update_id"))
         return
     chat_id = msg["chat"]["id"]
     msg_id = msg["message_id"]
@@ -741,10 +835,18 @@ def process_update(update):
         )
         return
 
-    card = extract_card(image_bytes)
+    card = extract_card(image_bytes, deadline=started + REQUEST_BUDGET_SECONDS)
     if not card.get("is_business_card", True):
         send_message(chat_id, "🤔 That doesn't look like a business card, so I didn't save it. "
                               + (card.get("miscellaneous") or ""), msg_id)
+        return
+
+    # Reading the card can take a while, and the same message may have been processed by another copy
+    # of this function in the meantime. Re-read the sheet NOW so anything saved meanwhile is noticed.
+    # (This is what prevents double rows.)
+    rows = ws.get_all_values()
+    if not force and unique_id in {cell(r, "Telegram File ID") for r in rows[1:]}:
+        send_message(chat_id, "ℹ️ This photo was just saved, so I didn't add it again.", msg_id)
         return
 
     # Person-level duplicate check (email, or name + company).
@@ -816,7 +918,7 @@ def app(environ, start_response):
     if method != "POST":
         return respond(405, "method not allowed")
 
-    secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
+    secret = env("TELEGRAM_WEBHOOK_SECRET")
     if not secret:
         return respond(500, "TELEGRAM_WEBHOOK_SECRET is not set")
     sent = environ.get("HTTP_X_TELEGRAM_BOT_API_SECRET_TOKEN", "")
@@ -835,7 +937,7 @@ def app(environ, start_response):
         log("ERROR:", traceback.format_exc())
         try:
             chat_id = update["message"]["chat"]["id"]
-            send_message(chat_id, f"❌ Something went wrong: {str(e)[:700]}")
+            send_message(chat_id, f"❌ {friendly_error(e)}")
         except Exception:
             pass
 
